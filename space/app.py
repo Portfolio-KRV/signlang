@@ -59,8 +59,9 @@ def extract_hand_region(image: np.ndarray, padding: float = 0.2):
     """Detect a hand with MediaPipe and return a square crop around it.
 
     Returns:
-        (cropped_rgb, detected_bool). If no hand is detected, returns
-        (None, False) and the caller can fall back to the original image.
+        (cropped_rgb, detected_bool, landmarks_or_none, bbox_or_none).
+        If no hand is detected, returns (None, False, None, None) and the
+        caller can fall back to the original image.
     """
     if image.ndim == 2:
         rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
@@ -73,7 +74,7 @@ def extract_hand_region(image: np.ndarray, padding: float = 0.2):
     results = get_hands_detector().process(rgb)
 
     if not results.multi_hand_landmarks:
-        return None, False
+        return None, False, None, None
 
     landmarks = results.multi_hand_landmarks[0]
     xs = [lm.x * w for lm in landmarks.landmark]
@@ -99,8 +100,37 @@ def extract_hand_region(image: np.ndarray, padding: float = 0.2):
 
     cropped = rgb[sy_min:sy_max, sx_min:sx_max]
     if cropped.size == 0:
-        return None, False
-    return cropped, True
+        return None, False, None, None
+
+    bbox = (sx_min, sy_min, sx_max, sy_max)
+    return cropped, True, landmarks, bbox
+
+
+def render_detection_overlay(image: np.ndarray, landmarks, bbox) -> np.ndarray:
+    """Draw the MediaPipe landmark skeleton + crop box on the original image.
+
+    Lets the user see what MediaPipe found before the CNN runs — useful
+    for diagnosing why a real-world photo classifies wrong.
+    """
+    if image.ndim == 2:
+        overlay = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.shape[2] == 4:
+        overlay = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+    else:
+        overlay = image.copy()
+
+    if landmarks is not None:
+        mp.solutions.drawing_utils.draw_landmarks(
+            overlay,
+            landmarks,
+            mp.solutions.hands.HAND_CONNECTIONS,
+            mp.solutions.drawing_styles.get_default_hand_landmarks_style(),
+            mp.solutions.drawing_styles.get_default_hand_connections_style(),
+        )
+    if bbox is not None:
+        x1, y1, x2, y2 = bbox
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (30, 144, 255), 3)
+    return overlay
 
 
 def preprocess(image: np.ndarray) -> np.ndarray:
@@ -122,10 +152,10 @@ EMPTY_RESULT = (
 
 def predict(image):
     if image is None:
-        yield None, EMPTY_RESULT
+        yield None, None, EMPTY_RESULT
         return
 
-    yield None, "⏳ Detecting hand and classifying…"
+    yield None, None, "⏳ Detecting hand and classifying…"
 
     if isinstance(image, Image.Image):
         image = np.array(image)
@@ -133,15 +163,21 @@ def predict(image):
     # 1. Try to find and crop the hand. On dataset samples (already pre-
     #    cropped to a tight 28x28 of just the hand), MediaPipe will fail
     #    to find a "hand" pose — we fall back to the original image.
-    cropped, hand_detected = extract_hand_region(image)
+    cropped, hand_detected, landmarks, bbox = extract_hand_region(image)
     cnn_input = cropped if hand_detected else image
 
-    detection_note = (
-        "✓ Hand detected — cropped to the hand region before classifying."
-        if hand_detected
-        else "ℹ️ No hand detected — passed the image straight to the CNN "
-             "(this is normal for pre-processed dataset samples)."
-    )
+    if hand_detected:
+        detection_overlay = render_detection_overlay(image, landmarks, bbox)
+        detection_note = (
+            f"✓ Hand detected — cropped to a {bbox[2]-bbox[0]}×{bbox[3]-bbox[1]}px "
+            "square around the hand before classifying."
+        )
+    else:
+        detection_overlay = image  # show the input as-is
+        detection_note = (
+            "ℹ️ No hand detected — passed the image straight to the CNN "
+            "(this is normal for pre-processed dataset samples)."
+        )
 
     # 2. Build the preview the user sees of "what the model sees".
     preview = cv2.resize(cnn_input, (168, 168))
@@ -174,12 +210,13 @@ def predict(image):
 
     lines.append("")
     lines.append(
-        "_Heads-up: the CNN was trained on Sign Language MNIST (28x28 grayscale, "
+        "_Heads-up: the CNN was trained on Sign Language MNIST (28×28 grayscale, "
         "uniform background, hand centered). MediaPipe Hands handles the framing "
         "for real-world photos, but unusual angles, partial occlusion, or "
-        "low contrast can still trip it up._"
+        "low contrast can still trip it up. Compare the two previews on the "
+        "right to see what each stage of the pipeline produced._"
     )
-    yield preview_gray, "\n".join(lines)
+    yield detection_overlay, preview_gray, "\n".join(lines)
 
 
 INTRO_MD = """
@@ -230,13 +267,21 @@ with gr.Blocks(title="Sign Language Recognition", theme=gr.themes.Soft()) as dem
                     examples_per_page=24,
                 )
         with gr.Column(scale=1):
+            detection_out = gr.Image(
+                label="Step 1 — MediaPipe Hands (landmarks + crop box)",
+                height=240,
+            )
             preview_out = gr.Image(
-                label="What the CNN sees (after hand crop, 28x28 grayscale)",
-                height=224,
+                label="Step 2 — What the CNN sees (28×28 grayscale)",
+                height=180,
             )
             results_md = gr.Markdown(EMPTY_RESULT)
 
-    input_image.change(predict, inputs=input_image, outputs=[preview_out, results_md])
+    input_image.change(
+        predict,
+        inputs=input_image,
+        outputs=[detection_out, preview_out, results_md],
+    )
 
 
 if __name__ == "__main__":
