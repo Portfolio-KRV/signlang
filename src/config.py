@@ -1,7 +1,6 @@
 """Configuration for Sign Language Recognition."""
 
 from pathlib import Path
-from typing import Any
 
 # Paths
 PROJECT_ROOT: Path = Path(__file__).parent.parent
@@ -37,9 +36,11 @@ LETTER_TO_LABEL: dict[str, int] = {letter: i for i, letter in enumerate(LETTERS)
 #    the original alphabet indices, so K=10, L=11, ..., Y=24. Use
 #    CSV_LABEL_TO_LETTER / LETTER_TO_CSV_LABEL when reading the CSV directly.
 CSV_LABEL_TO_LETTER: dict[int, str] = dict(
-    zip(list(range(0, 9)) + list(range(10, 25)), LETTERS)
+    zip(list(range(0, 9)) + list(range(10, 25)), LETTERS, strict=True)
 )
-LETTER_TO_CSV_LABEL: dict[str, int] = {l: c for c, l in CSV_LABEL_TO_LETTER.items()}
+LETTER_TO_CSV_LABEL: dict[str, int] = {
+    letter: code for code, letter in CSV_LABEL_TO_LETTER.items()
+}
 
 # Training parameters
 BATCH_SIZE: int = 32
