@@ -44,15 +44,42 @@ def get_model():
 
 
 def get_hands_detector():
-    """Lazily build the MediaPipe Hands detector (static-image mode)."""
+    """Lazily build the MediaPipe Hands detector (static-image mode).
+
+    Low confidence threshold (0.1) — we'd rather have a few false
+    detections we can sanity-check via the overlay than miss real hands.
+    """
     global _hands
     if _hands is None:
         _hands = mp.solutions.hands.Hands(
             static_image_mode=True,
             max_num_hands=1,
-            min_detection_confidence=0.3,
+            min_detection_confidence=0.1,
         )
     return _hands
+
+
+# MediaPipe Hands rinde mejor en resoluciones medias. Imágenes muy chicas
+# pierden landmarks por upscaling interno; muy grandes se vuelven lentas.
+MIN_LONG_EDGE = 480
+MAX_LONG_EDGE = 1280
+# Imágenes ≤ este lado son tratadas como samples del dataset (28×28
+# pre-cropped). MediaPipe no encuentra "manos" en ellas y eso es esperado.
+SAMPLE_HEURISTIC = 100
+
+
+def normalize_for_detection(image: np.ndarray) -> np.ndarray:
+    """Resize the image to a range MediaPipe handles well, keeping aspect."""
+    h, w = image.shape[:2]
+    long_edge = max(h, w)
+    if long_edge < MIN_LONG_EDGE:
+        scale = MIN_LONG_EDGE / long_edge
+    elif long_edge > MAX_LONG_EDGE:
+        scale = MAX_LONG_EDGE / long_edge
+    else:
+        return image
+    new_w, new_h = int(w * scale), int(h * scale)
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 def extract_hand_region(image: np.ndarray, padding: float = 0.2):
@@ -70,6 +97,7 @@ def extract_hand_region(image: np.ndarray, padding: float = 0.2):
     else:
         rgb = image
 
+    rgb = normalize_for_detection(rgb)
     h, w = rgb.shape[:2]
     results = get_hands_detector().process(rgb)
 
@@ -160,24 +188,44 @@ def predict(image):
     if isinstance(image, Image.Image):
         image = np.array(image)
 
-    # 1. Try to find and crop the hand. On dataset samples (already pre-
-    #    cropped to a tight 28x28 of just the hand), MediaPipe will fail
-    #    to find a "hand" pose — we fall back to the original image.
+    # 1. Try to find and crop the hand. Behavior diverges by image size:
+    #    - Small images (≤100px) are dataset samples — MediaPipe usually
+    #      can't find a "hand" pose in the 28×28 crops, but the CNN can
+    #      classify them directly. Fall back to the original image.
+    #    - Larger images are real photos — if MediaPipe fails, the CNN
+    #      will produce noise. Tell the user to retake.
+    h_in, w_in = image.shape[:2]
+    is_sample = max(h_in, w_in) <= SAMPLE_HEURISTIC
+
     cropped, hand_detected, landmarks, bbox = extract_hand_region(image)
-    cnn_input = cropped if hand_detected else image
 
     if hand_detected:
+        cnn_input = cropped
         detection_overlay = render_detection_overlay(image, landmarks, bbox)
         detection_note = (
             f"✓ Hand detected — cropped to a {bbox[2]-bbox[0]}×{bbox[3]-bbox[1]}px "
             "square around the hand before classifying."
         )
-    else:
-        detection_overlay = image  # show the input as-is
+    elif is_sample:
+        cnn_input = image
+        detection_overlay = image
         detection_note = (
-            "ℹ️ No hand detected — passed the image straight to the CNN "
-            "(this is normal for pre-processed dataset samples)."
+            "ℹ️ Dataset sample — passed straight to the CNN "
+            "(MediaPipe doesn't try on pre-cropped 28×28 inputs)."
         )
+    else:
+        # Real-world photo where MediaPipe couldn't find a hand. Skipping
+        # CNN inference and asking for a better shot is more honest than
+        # serving a noisy prediction.
+        yield image, None, (
+            "### ⚠️ Couldn't locate a hand in your photo\n\n"
+            "MediaPipe couldn't detect a hand in this image. Try:\n\n"
+            "- Better lighting (avoid backlight, move closer to a lamp)\n"
+            "- Center your hand in frame, palm facing the camera\n"
+            "- Plain background helps the detector lock on\n"
+            "- Or pick a sample below to see the CNN classify directly"
+        )
+        return
 
     # 2. Build the preview the user sees of "what the model sees".
     preview = cv2.resize(cnn_input, (168, 168))
